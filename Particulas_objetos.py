@@ -1,53 +1,179 @@
 import math
 import random
+import json
 import numpy as np
-import plotly.graph_objects as go
+
+
+def cargar_parametros_json(ruta_json):
+    """Lee las dimensiones y el total global de partículas desde el JSON."""
+    with open(ruta_json, "r", encoding="utf-8") as archivo:
+        config = json.load(archivo)
+    try:
+        dimensiones = config["dimensiones"]
+        ancho = float(dimensiones["ancho"])
+        alto = float(dimensiones["alto"])
+        profundo = float(dimensiones["profundo"])
+        num_particulas = config["total_particulas"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"El JSON no contiene dimensiones o el total global válido: {error}") from error
+
+    if (
+        isinstance(num_particulas, bool)
+        or not isinstance(num_particulas, int)
+        or min(ancho, alto, profundo) <= 0
+        or num_particulas <= 0
+    ):
+        raise ValueError("El JSON debe solicitar dimensiones y cantidad de partículas mayores que cero.")
+    volumen_calculado = ancho * alto * profundo
+    volumen_declarado = dimensiones.get("volumen_total")
+    if volumen_declarado is not None and not math.isclose(
+        float(volumen_declarado), volumen_calculado, rel_tol=1e-6, abs_tol=1e-6
+    ):
+        raise ValueError("El volumen_total del JSON no coincide con sus dimensiones.")
+    estimacion = config.get("estimaciones", {}).get("total_particulas_estimadas")
+    if estimacion is not None and estimacion != num_particulas:
+        raise ValueError("El total global no coincide con el total registrado en estimaciones.")
+    return ancho, alto, profundo, num_particulas
 
 
 def generar_espacio_perturbado(
-    num_particulas=80, ancho_total=100, alto_total=100, profundo_total=100
+    num_particulas,
+    ancho_total,
+    alto_total,
+    profundo_total,
+    rango_perturbacion=0.3,
 ):
+    """Crea semillas en una malla regular y las perturba dentro de la caja.
+
+    ``rango_perturbacion`` es una fracción del espaciado local por eje:
+    0.3 permite un desplazamiento de hasta ±30 % del espaciado.
+    """
+    if num_particulas <= 0:
+        raise ValueError("num_particulas debe ser mayor que cero.")
+    if min(ancho_total, alto_total, profundo_total) <= 0:
+        raise ValueError("Las dimensiones de la caja deben ser mayores que cero.")
+    if not 0 <= rango_perturbacion < 0.5:
+        raise ValueError("rango_perturbacion debe estar entre 0 y 0.5.")
+
     volumen = ancho_total * alto_total * profundo_total
     s = (volumen / num_particulas) ** (1 / 3)
 
-    cols = max(1, round(ancho_total / s))
-    rows = max(1, round(alto_total / s))
-    layers = max(1, round(profundo_total / s))
+    cols = max(1, math.ceil(ancho_total / s))
+    rows = max(1, math.ceil(alto_total / s))
+    layers = max(1, math.ceil(profundo_total / s))
 
     espaciado_x = ancho_total / cols
     espaciado_y = alto_total / rows
     espaciado_z = profundo_total / layers
 
-    puntos_todos = []
-    puntos_interiores = []
+    # Seleccionar exactamente el número solicitado de celdas del mallado.
+    indices_malla = np.linspace(0, cols * rows * layers - 1, num_particulas)
+    indices_malla = np.unique(np.rint(indices_malla).astype(int))
+    # La malla tiene al menos num_particulas celdas, y linspace proporciona
+    # exactamente esa cantidad de índices distintos.
+    puntos = []
+    for indice in indices_malla:
+        i = int(indice // (rows * layers))
+        resto = int(indice % (rows * layers))
+        j = resto // layers
+        k = resto % layers
+        base_x = (i + 0.5) * espaciado_x
+        base_y = (j + 0.5) * espaciado_y
+        base_z = (k + 0.5) * espaciado_z
+        x = base_x + random.uniform(-rango_perturbacion, rango_perturbacion) * espaciado_x
+        y = base_y + random.uniform(-rango_perturbacion, rango_perturbacion) * espaciado_y
+        z = base_z + random.uniform(-rango_perturbacion, rango_perturbacion) * espaciado_z
+        puntos.append((x, y, z))
 
-    # Capa de puntos fantasma (-1 a +1) para cerrar correctamente las celdas en los bordes
-    for i in range(-1, cols + 1):
-        for j in range(-1, rows + 1):
-            for k in range(-1, layers + 1):
-                base_x = i * espaciado_x + (espaciado_x / 2)
-                base_y = j * espaciado_y + (espaciado_y / 2)
-                base_z = k * espaciado_z + (espaciado_z / 2)
+    if len(puntos) != num_particulas:
+        raise RuntimeError("No fue posible crear exactamente el número de semillas solicitado.")
 
-                pert_x = random.uniform(-0.3, 0.3) * espaciado_x
-                pert_y = random.uniform(-0.3, 0.3) * espaciado_y
-                pert_z = random.uniform(-0.3, 0.3) * espaciado_z
+    # Todas las semillas están dentro de la caja; no se crean puntos fantasma externos.
+    return puntos, puntos
 
-                x = base_x + pert_x
-                y = base_y + pert_y
-                z = base_z + pert_z
 
-                pt = (x, y, z)
-                puntos_todos.append(pt)
+def _recortar_cara_plano(cara, normal, limite, tolerancia=1e-9):
+    """Recorta un polígono para conservar los puntos con dot(normal, p) <= limite."""
+    if not cara:
+        return [], []
+    recortada = []
+    intersecciones = []
+    for a, b in zip(cara, cara[1:] + cara[:1]):
+        da = float(np.dot(normal, a) - limite)
+        db = float(np.dot(normal, b) - limite)
+        dentro_a = da <= tolerancia
+        dentro_b = db <= tolerancia
+        if dentro_a:
+            recortada.append(tuple(a))
+        if dentro_a != dentro_b:
+            t = da / (da - db)
+            punto = tuple(np.asarray(a) + t * (np.asarray(b) - np.asarray(a)))
+            recortada.append(punto)
+            intersecciones.append(punto)
+    return recortada, intersecciones
 
-                # Restringimos las semillas interiores dentro del dominio [0, dimension]
-                if 0 <= i < cols and 0 <= j < rows and 0 <= k < layers:
-                    x_in = max(0.01, min(ancho_total - 0.01, x))
-                    y_in = max(0.01, min(alto_total - 0.01, y))
-                    z_in = max(0.01, min(profundo_total - 0.01, z))
-                    puntos_interiores.append((x_in, y_in, z_in))
 
-    return puntos_todos, puntos_interiores
+def _recortar_poliedro_plano(caras, normal, limite):
+    """Recorta un poliedro convexo y agrega la nueva cara de corte."""
+    nuevas_caras = []
+    corte = []
+    for cara in caras:
+        recortada, cruces = _recortar_cara_plano(cara, normal, limite)
+        if len(recortada) >= 3:
+            nuevas_caras.append(recortada)
+        corte.extend(cruces)
+
+    unicos = []
+    for punto in corte:
+        if not any(np.linalg.norm(np.asarray(punto) - np.asarray(q)) < 1e-8 for q in unicos):
+            unicos.append(punto)
+    if len(unicos) >= 3:
+        centro = np.mean(unicos, axis=0)
+        n = np.asarray(normal, dtype=float)
+        n_norm = np.linalg.norm(n)
+        if n_norm > 0:
+            n /= n_norm
+            eje = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(n, eje)) > 0.9:
+                eje = np.array([0.0, 1.0, 0.0])
+            u = np.cross(n, eje)
+            u /= np.linalg.norm(u)
+            v = np.cross(n, u)
+            unicos.sort(key=lambda p: math.atan2(np.dot(np.asarray(p) - centro, v), np.dot(np.asarray(p) - centro, u)))
+            nuevas_caras.append(unicos)
+    return nuevas_caras
+
+
+def _celda_voronoi_recortada(
+    semilla, semillas, ancho, alto, profundo, competidores=None
+):
+    """Interseca la caja con los semiespacios de Voronoi de las otras semillas."""
+    x, y, z = semilla
+    caras = [
+        [(0, 0, 0), (0, alto, 0), (0, alto, profundo), (0, 0, profundo)],
+        [(ancho, 0, 0), (ancho, 0, profundo), (ancho, alto, profundo), (ancho, alto, 0)],
+        [(0, 0, 0), (0, 0, profundo), (ancho, 0, profundo), (ancho, 0, 0)],
+        [(0, alto, 0), (ancho, alto, 0), (ancho, alto, profundo), (0, alto, profundo)],
+        [(0, 0, 0), (ancho, 0, 0), (ancho, alto, 0), (0, alto, 0)],
+        [(0, 0, profundo), (0, alto, profundo), (ancho, alto, profundo), (ancho, 0, profundo)],
+    ]
+    p = np.asarray(semilla, dtype=float)
+    sitios = semillas if competidores is None else sorted(competidores)
+    for otra in sitios:
+        if otra == semilla:
+            continue
+        q = np.asarray(otra, dtype=float)
+        normal = 2.0 * (q - p)
+        limite = float(np.dot(q, q) - np.dot(p, p))
+        caras = _recortar_poliedro_plano(caras, normal, limite)
+        if not caras:
+            break
+    # El redondeo numérico de intersecciones puede producir excesos microscópicos.
+    limites = np.array([ancho, alto, profundo], dtype=float)
+    return [
+        [tuple(np.clip(np.asarray(p, dtype=float), 0.0, limites)) for p in cara]
+        for cara in caras
+    ]
 
 
 def esfera_circunscrita(tetra):
@@ -137,7 +263,7 @@ def completar_triangulacion(punto_nuevo, caras_borde, lista_principal):
         lista_principal.append(nuevo_tetraedro)
 
 
-def delaunay_3d_con_params(points, ancho=100, alto=100, profundo=100):
+def delaunay_3d_con_params(points, ancho, alto, profundo):
     # Súper-tetraedro escalado dinámicamente según el tamaño del volumen
     limite = max(ancho, alto, profundo) * 50
     supa_tetra = (
@@ -163,201 +289,47 @@ def delaunay_3d_con_params(points, ancho=100, alto=100, profundo=100):
     return tetraedros_limpios
 
 
-def ordenar_puntos_cara_3d(puntos_cara, p_origen, p_vecino):
-    if len(puntos_cara) < 3:
-        return puntos_cara
-
-    arr_puntos = np.array(puntos_cara)
-    centroide = np.mean(arr_puntos, axis=0)
-
-    v = np.array(p_vecino) - np.array(p_origen)
-    norm_v = np.linalg.norm(v)
-    if norm_v == 0:
-        return puntos_cara
-    v = v / norm_v
-
-    arbitrario = np.array([1.0, 0.0, 0.0])
-    if abs(np.dot(v, arbitrario)) > 0.9:
-        arbitrario = np.array([0.0, 1.0, 0.0])
-
-    e1 = np.cross(v, arbitrario)
-    e1 = e1 / np.linalg.norm(e1)
-    e2 = np.cross(v, e1)
-
-    angulos = []
-    for pt in arr_puntos:
-        diff = pt - centroide
-        x = np.dot(diff, e1)
-        y = np.dot(diff, e2)
-        angulos.append(math.atan2(y, x))
-
-    pares = sorted(zip(angulos, puntos_cara), key=lambda x: x[0])
-    return [p[1] for p in pares]
-
-
-def voronoi_3d_puro(
-    rango_caras=(4, 100),
-    ancho=100,
-    alto=100,
-    profundo=100,
-    num_particulas=80,
-):
-    cota_inf, cota_sup = rango_caras
+def voronoi_3d_puro(ruta_json="config_simulacion.json", rango_perturbacion=0.3):
+    ancho, alto, profundo, num_particulas = cargar_parametros_json(ruta_json)
     puntos_todos, puntos_interiores = generar_espacio_perturbado(
-        num_particulas, ancho, alto, profundo
+        num_particulas, ancho, alto, profundo, rango_perturbacion
     )
+    # Bowyer–Watson identifica los vecinos de Delaunay de cada semilla.
     tetraedros = delaunay_3d_con_params(puntos_todos, ancho, alto, profundo)
+    vecinos = {p: set() for p in puntos_interiores}
+    for tetra in tetraedros:
+        for punto in tetra:
+            if punto in vecinos:
+                vecinos[punto].update(otro for otro in tetra if otro != punto)
+
     poliedros = []
-
     for p in puntos_interiores:
-        vecinos_dict = {}
-        for tetra in tetraedros:
-            if p in tetra:
-                center, _ = esfera_circunscrita(tetra)
-                if center is not None:
-                    for vertice in tetra:
-                        if vertice != p:
-                            if vertice not in vecinos_dict:
-                                vecinos_dict[vertice] = []
-                            vecinos_dict[vertice].append(tuple(center))
+        candidatos = vecinos[p] or {otro for otro in puntos_interiores if otro != p}
+        celda = _celda_voronoi_recortada(
+            p, puntos_interiores, ancho, alto, profundo, candidatos
+        )
 
-        caras_poliedro = []
-        for vecino, puntos_cara in vecinos_dict.items():
-            puntos_cara = list(set(puntos_cara))
-            if len(puntos_cara) >= 3:
-                cara_ordenada = ordenar_puntos_cara_3d(puntos_cara, p, vecino)
-                caras_poliedro.append(cara_ordenada)
-
-        if cota_inf <= len(caras_poliedro) <= cota_sup:
-            # Se guardan las celdas de Voronoi puras sin realizar contracción
-            poliedros.append(caras_poliedro)
+        # Completar candidatos si una triangulación degenerada omitió algún
+        # vecino: todo vértice debe estar del lado de Voronoi de esta semilla.
+        while True:
+            vertices = [np.asarray(v, dtype=float) for cara in celda for v in cara]
+            faltantes = []
+            p_arr = np.asarray(p, dtype=float)
+            for otro in puntos_interiores:
+                if otro == p or otro in candidatos:
+                    continue
+                q = np.asarray(otro, dtype=float)
+                normal = 2.0 * (q - p_arr)
+                limite = float(np.dot(q, q) - np.dot(p_arr, p_arr))
+                if any(np.dot(normal, v) > limite + 1e-7 for v in vertices):
+                    faltantes.append(otro)
+            if not faltantes:
+                break
+            candidatos.update(faltantes)
+            celda = _celda_voronoi_recortada(
+                p, puntos_interiores, ancho, alto, profundo, candidatos
+            )
+        poliedros.append(celda)
 
     return poliedros, puntos_interiores
 
-
-def visualizar_voronoi_solido(poliedros, puntos_semilla):
-    fig = go.Figure()
-    edge_x, edge_y, edge_z = [], [], []
-
-    for poliedro in poliedros:
-        r, g, b = (
-            random.randint(80, 240),
-            random.randint(80, 240),
-            random.randint(80, 240),
-        )
-        color = f"rgb({r}, {g}, {b})"
-
-        x_all, y_all, z_all = [], [], []
-        i_indices, j_indices, k_indices = [], [], []
-        vertex_offset = 0
-
-        for cara in poliedro:
-            if len(cara) < 3:
-                continue
-
-            face_indices = []
-            for i, v in enumerate(cara):
-                x_all.append(v[0])
-                y_all.append(v[1])
-                z_all.append(v[2])
-                face_indices.append(vertex_offset)
-                vertex_offset += 1
-
-                v_siguiente = cara[(i + 1) % len(cara)]
-                edge_x.extend([v[0], v_siguiente[0], None])
-                edge_y.extend([v[1], v_siguiente[1], None])
-                edge_z.extend([v[2], v_siguiente[2], None])
-
-            for idx_cara in range(1, len(face_indices) - 1):
-                i_indices.append(face_indices[0])
-                j_indices.append(face_indices[idx_cara])
-                k_indices.append(face_indices[idx_cara + 1])
-
-        if x_all:
-            fig.add_trace(
-                go.Mesh3d(
-                    x=x_all,
-                    y=y_all,
-                    z=z_all,
-                    i=i_indices,
-                    j=j_indices,
-                    k=k_indices,
-                    color=color,
-                    opacity=0.6,
-                    flatshading=True,
-                    lighting=dict(
-                        ambient=0.6, diffuse=0.8, roughness=0.8, specular=0.1
-                    ),
-                    hoverinfo="none",
-                )
-            )
-
-    fig.add_trace(
-        go.Scatter3d(
-            x=edge_x,
-            y=edge_y,
-            z=edge_z,
-            mode="lines",
-            line=dict(color="rgb(30, 30, 30)", width=3),
-            hoverinfo="none",
-            showlegend=False,
-        )
-    )
-
-    px = [p[0] for p in puntos_semilla]
-    py = [p[1] for p in puntos_semilla]
-    pz = [p[2] for p in puntos_semilla]
-    fig.add_trace(
-        go.Scatter3d(
-            x=px,
-            y=py,
-            z=pz,
-            mode="markers",
-            marker=dict(size=4, color="black", symbol="circle"),
-            name="Semillas",
-        )
-    )
-
-    fig.update_layout(
-        title=dict(
-            text="Espacio de Voronoi Continuo (Sin Contracción)",
-            font=dict(color="black", size=20),
-        ),
-        paper_bgcolor="rgb(245, 245, 245)",
-        scene=dict(
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            bgcolor="rgb(245, 245, 245)",
-        ),
-        margin=dict(l=0, r=0, b=0, t=50),
-    )
-
-    fig.show()
-
-
-# ==============================================================================
-# TEST DE PRUEBA
-# ==============================================================================
-if __name__ == "__main__":
-    ANCHO, ALTO, PROFUNDO = 100, 100, 100
-    NUM_PARTICULAS = 40
-
-    print("--- INICIANDO TEST DE GENERACIÓN VORONOI ---")
-    print(f"Dimensiones del espacio: {ANCHO}x{ALTO}x{PROFUNDO} mm")
-    print(f"Semillas solicitadas: {NUM_PARTICULAS}")
-
-    poliedros_generados, semillas_interiores = voronoi_3d_puro(
-        rango_caras=(4, 100),
-        ancho=ANCHO,
-        alto=ALTO,
-        profundo=PROFUNDO,
-        num_particulas=NUM_PARTICULAS,
-    )
-
-    print(
-        f"✓ Generación exitosa: {len(poliedros_generados)} celdas de Voronoi continuas creadas."
-    )
-    print("Abriendo visor 3D interactivo...")
-
-    visualizar_voronoi_solido(poliedros_generados, semillas_interiores)
